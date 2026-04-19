@@ -18,6 +18,7 @@ import hashlib
 import json
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 
@@ -38,7 +39,7 @@ STAGING_TABLE = "stg_amz_sales_traffic_daily"
 BACKFILL_START = datetime(2025, 1, 1, tzinfo=UTC)
 
 # Pause between days to avoid hitting API rate limits
-SLEEP_BETWEEN_DAYS = 2  # seconds
+SLEEP_BETWEEN_DAYS = 8  # seconds
 
 
 def utc_now() -> datetime:
@@ -349,86 +350,91 @@ def load_staging_rows(conn, rows, report_id, document_id, s3_key, file_checksum)
     return inserted
 
 
-def process_day(conn, marketplace_name, marketplace_enum, marketplace_id, day: datetime):
+def process_day(marketplace_name, marketplace_enum, marketplace_id, day: datetime):
     """Process one day for one marketplace. Skips if already loaded."""
 
-    if is_day_already_loaded(conn, marketplace_name, day):
-        print(f"  [{marketplace_name}] {day.date()} — already loaded, skipping")
-        return
-
-    requested_at = utc_now()
-    report_id = None
-    document_id = None
-    s3_key = None
-    file_checksum = None
-    local_file_path = None
-    downloaded_at = None
-    loaded_at = None
-    row_count = None
+    conn = get_postgres_connection()
 
     try:
-        reports_api, report_id = request_report(
-            marketplace_name, marketplace_enum, marketplace_id, day
-        )
-        log_job_status(
-            conn, marketplace=marketplace_name,
-            report_id=report_id, document_id=None,
-            request_status="requested", requested_at=requested_at,
-        )
-        conn.commit()
+        if is_day_already_loaded(conn, marketplace_name, day):
+            print(f"  [{marketplace_name}] {day.date()} — already loaded, skipping")
+            return
 
-        document_id = wait_for_report(reports_api, report_id, marketplace_name, day)
-        payload = download_report_payload(reports_api, document_id)
-        downloaded_at = utc_now()
-        file_checksum = sha256_hex(payload["original_bytes"])
+        requested_at = utc_now()
+        report_id = None
+        document_id = None
+        s3_key = None
+        file_checksum = None
+        local_file_path = None
+        downloaded_at = None
+        loaded_at = None
+        row_count = None
 
-        local_path = save_raw_files(payload, marketplace_name, day)
-        local_file_path = str(local_path)
-        s3_key = upload_to_s3(local_path, marketplace_name, day)
+        try:
+            reports_api, report_id = request_report(
+                marketplace_name, marketplace_enum, marketplace_id, day
+            )
+            log_job_status(
+                conn, marketplace=marketplace_name,
+                report_id=report_id, document_id=None,
+                request_status="requested", requested_at=requested_at,
+            )
+            conn.commit()
 
-        log_job_status(
-            conn, marketplace=marketplace_name,
-            report_id=report_id, document_id=document_id,
-            request_status="downloaded", requested_at=requested_at,
-            downloaded_at=downloaded_at, local_file_path=local_file_path,
-            s3_key=s3_key, file_checksum=file_checksum,
-        )
-        conn.commit()
+            document_id = wait_for_report(reports_api, report_id, marketplace_name, day)
+            payload = download_report_payload(reports_api, document_id)
+            downloaded_at = utc_now()
+            file_checksum = sha256_hex(payload["original_bytes"])
 
-        report_json = json.loads(payload["parsed_bytes"].decode("utf-8"))
-        rows = parse_rows(report_json, marketplace_name, day)
-        row_count = load_staging_rows(
-            conn, rows,
-            report_id=report_id, document_id=document_id,
-            s3_key=s3_key, file_checksum=file_checksum,
-        )
-        loaded_at = utc_now()
+            local_path = save_raw_files(payload, marketplace_name, day)
+            local_file_path = str(local_path)
+            s3_key = upload_to_s3(local_path, marketplace_name, day)
 
-        log_job_status(
-            conn, marketplace=marketplace_name,
-            report_id=report_id, document_id=document_id,
-            request_status="completed", requested_at=requested_at,
-            downloaded_at=downloaded_at, loaded_at=loaded_at,
-            completed_at=loaded_at, local_file_path=local_file_path,
-            s3_key=s3_key, file_checksum=file_checksum, row_count=row_count,
-        )
-        conn.commit()
+            log_job_status(
+                conn, marketplace=marketplace_name,
+                report_id=report_id, document_id=document_id,
+                request_status="downloaded", requested_at=requested_at,
+                downloaded_at=downloaded_at, local_file_path=local_file_path,
+                s3_key=s3_key, file_checksum=file_checksum,
+            )
+            conn.commit()
 
-        print(f"  [{marketplace_name}] {day.date()} — inserted {row_count} rows")
+            report_json = json.loads(payload["parsed_bytes"].decode("utf-8"))
+            rows = parse_rows(report_json, marketplace_name, day)
+            row_count = load_staging_rows(
+                conn, rows,
+                report_id=report_id, document_id=document_id,
+                s3_key=s3_key, file_checksum=file_checksum,
+            )
+            loaded_at = utc_now()
 
-    except Exception as exc:
-        log_job_status(
-            conn, marketplace=marketplace_name,
-            report_id=report_id, document_id=document_id,
-            request_status="failed", requested_at=requested_at,
-            downloaded_at=downloaded_at, loaded_at=loaded_at,
-            completed_at=utc_now(), local_file_path=local_file_path,
-            s3_key=s3_key, file_checksum=file_checksum, row_count=row_count,
-            error_message=str(exc),
-        )
-        conn.commit()
-        # Log and continue — don't let one failed day stop the entire backfill
-        print(f"  [{marketplace_name}] {day.date()} — FAILED: {exc}")
+            log_job_status(
+                conn, marketplace=marketplace_name,
+                report_id=report_id, document_id=document_id,
+                request_status="completed", requested_at=requested_at,
+                downloaded_at=downloaded_at, loaded_at=loaded_at,
+                completed_at=loaded_at, local_file_path=local_file_path,
+                s3_key=s3_key, file_checksum=file_checksum, row_count=row_count,
+            )
+            conn.commit()
+
+            print(f"  [{marketplace_name}] {day.date()} — inserted {row_count} rows")
+
+        except Exception as exc:
+            log_job_status(
+                conn, marketplace=marketplace_name,
+                report_id=report_id, document_id=document_id,
+                request_status="failed", requested_at=requested_at,
+                downloaded_at=downloaded_at, loaded_at=loaded_at,
+                completed_at=utc_now(), local_file_path=local_file_path,
+                s3_key=s3_key, file_checksum=file_checksum, row_count=row_count,
+                error_message=str(exc),
+            )
+            conn.commit()
+            # Log and continue — don't let one failed day stop the entire backfill
+            print(f"  [{marketplace_name}] {day.date()} — FAILED: {exc}")
+    finally:
+        conn.close()
 
 
 def main():
@@ -454,14 +460,25 @@ def main():
             ensure_log_table_exists(conn)
             ensure_staging_table_exists(conn)
 
-        for i, day in enumerate(days, 1):
-            print(f"Day {i}/{len(days)}: {day.date()}")
-            for marketplace_name, marketplace_enum, marketplace_id in marketplaces:
-                process_day(conn, marketplace_name, marketplace_enum, marketplace_id, day)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            for i, day in enumerate(days, 1):
+                print(f"Day {i}/{len(days)}: {day.date()}")
+                futures = [
+                    executor.submit(
+                        process_day,
+                        marketplace_name,
+                        marketplace_enum,
+                        marketplace_id,
+                        day,
+                    )
+                    for marketplace_name, marketplace_enum, marketplace_id in marketplaces
+                ]
+                for future in futures:
+                    future.result()
 
-            # Pause between days to respect API rate limits
-            if i < len(days):
-                time.sleep(SLEEP_BETWEEN_DAYS)
+                # Pause between days to respect API rate limits
+                if i < len(days):
+                    time.sleep(SLEEP_BETWEEN_DAYS)
 
     finally:
         conn.close()
