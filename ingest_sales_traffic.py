@@ -2,6 +2,7 @@ import gzip
 import hashlib
 import json
 import time
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
 from typing import Any
@@ -28,15 +29,13 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def get_last_full_sunday_saturday_week():
+def get_yesterday() -> tuple[datetime, datetime]:
+    """Return yesterday as (start_date, end_date) — both the same day."""
     now = utc_now()
-    days_since_sunday = (now.weekday() + 1) % 7
-    this_sunday = (now - timedelta(days=days_since_sunday)).replace(
+    yesterday = (now - timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    start_date = this_sunday - timedelta(days=7)
-    end_date = this_sunday - timedelta(days=1)
-    return start_date, end_date
+    return yesterday, yesterday
 
 
 def get_sp_api_credentials():
@@ -130,40 +129,18 @@ def log_job_status(
 ):
     sql = f"""
         INSERT INTO {LOG_TABLE} (
-            source_system,
-            report_type,
-            marketplace,
-            report_id,
-            document_id,
-            request_status,
-            requested_at,
-            downloaded_at,
-            loaded_at,
-            completed_at,
-            local_file_path,
-            s3_key,
-            file_checksum,
-            row_count,
-            error_message,
-            updated_at
+            source_system, report_type, marketplace,
+            report_id, document_id, request_status,
+            requested_at, downloaded_at, loaded_at, completed_at,
+            local_file_path, s3_key, file_checksum,
+            row_count, error_message, updated_at
         )
         VALUES (
-            %(source_system)s,
-            %(report_type)s,
-            %(marketplace)s,
-            %(report_id)s,
-            %(document_id)s,
-            %(request_status)s,
-            %(requested_at)s,
-            %(downloaded_at)s,
-            %(loaded_at)s,
-            %(completed_at)s,
-            %(local_file_path)s,
-            %(s3_key)s,
-            %(file_checksum)s,
-            %(row_count)s,
-            %(error_message)s,
-            NOW()
+            %(source_system)s, %(report_type)s, %(marketplace)s,
+            %(report_id)s, %(document_id)s, %(request_status)s,
+            %(requested_at)s, %(downloaded_at)s, %(loaded_at)s, %(completed_at)s,
+            %(local_file_path)s, %(s3_key)s, %(file_checksum)s,
+            %(row_count)s, %(error_message)s, NOW()
         )
         ON CONFLICT (source_system, report_type, marketplace, report_id, document_id)
         DO UPDATE SET
@@ -221,7 +198,7 @@ def is_job_already_completed(conn, marketplace: str, report_id: str, document_id
 
 
 def request_sales_traffic_report(marketplace_name, marketplace_enum, marketplace_id, start_date, end_date):
-    print(f"Requesting Sales & Traffic report for {marketplace_name}...")
+    print(f"Requesting Sales & Traffic report for {marketplace_name} ({start_date.date()})...")
     reports_api = get_reports_api(marketplace_enum)
 
     response = reports_api.create_report(
@@ -230,7 +207,7 @@ def request_sales_traffic_report(marketplace_name, marketplace_enum, marketplace
         dataEndTime=end_date.strftime("%Y-%m-%d"),
         marketplaceIds=[marketplace_id],
         reportOptions={
-            "dateGranularity": "WEEK",
+            "dateGranularity": "DAY",       # <-- changed from WEEK to DAY
             "asinGranularity": "CHILD",
         },
     )
@@ -240,7 +217,6 @@ def request_sales_traffic_report(marketplace_name, marketplace_enum, marketplace
     return reports_api, report_id
 
 
-# FIX #4: poll settings now come from config instead of hardcoded defaults
 def wait_for_report(reports_api, report_id, marketplace_name):
     max_attempts = config.REPORT_POLL_MAX_ATTEMPTS
     sleep_seconds = config.REPORT_POLL_SLEEP_SECONDS
@@ -269,7 +245,6 @@ def download_report_payload(reports_api, document_id):
     url = doc.payload["url"]
     compression = doc.payload.get("compressionAlgorithm")
 
-    import urllib.request
     with urllib.request.urlopen(url) as response:
         original_bytes = response.read()
 
@@ -300,11 +275,10 @@ def save_raw_files(payload: dict[str, Any], marketplace_name, start_date, end_da
     paths = build_raw_paths(marketplace_name, start_date, end_date, payload["compression"])
 
     paths["original_path"].write_bytes(payload["original_bytes"])
-    print(f"Saved original raw file locally: {paths['original_path']}")
+    print(f"Saved raw file: {paths['original_path']}")
 
     if paths["parsed_path"] != paths["original_path"]:
         paths["parsed_path"].write_bytes(payload["parsed_bytes"])
-        print(f"Saved decompressed parse copy locally: {paths['parsed_path']}")
 
     return paths
 
@@ -322,6 +296,12 @@ def upload_to_s3(local_path: Path, marketplace_name, start_date):
 
 
 def parse_sales_traffic_rows(report_json, marketplace_name, start_date, end_date):
+    """
+    Parse the report JSON into rows.
+
+    With DAY granularity, each row in salesAndTrafficByAsin represents
+    one product on one specific day. start_date == end_date.
+    """
     rows = []
     asin_rows = report_json.get("salesAndTrafficByAsin", [])
 
@@ -329,76 +309,52 @@ def parse_sales_traffic_rows(report_json, marketplace_name, start_date, end_date
         sales = row.get("salesByAsin", {})
         traffic = row.get("trafficByAsin", {})
 
-        rows.append(
-            {
-                "marketplace": marketplace_name,
-                "start_date": start_date.date(),
-                "end_date": end_date.date(),
-                "child_asin": row.get("childAsin"),
-                "parent_asin": row.get("parentAsin"),
-                "sku": row.get("sku"),
-                "sessions": traffic.get("sessions"),
-                "page_views": traffic.get("pageViews"),
-                "buy_box_percentage": traffic.get("buyBoxPercentage"),
-                "units_ordered": sales.get("unitsOrdered"),
-                "ordered_product_sales_amount": (sales.get("orderedProductSales") or {}).get("amount"),
-                "ordered_product_sales_currency": (sales.get("orderedProductSales") or {}).get("currencyCode"),
-                "unit_session_percentage": traffic.get("unitSessionPercentage"),
-            }
-        )
+        rows.append({
+            "marketplace": marketplace_name,
+            "start_date": start_date.date(),
+            "end_date": end_date.date(),
+            "child_asin": row.get("childAsin"),
+            "parent_asin": row.get("parentAsin"),
+            "sku": row.get("sku"),
+            "sessions": traffic.get("sessions"),
+            "page_views": traffic.get("pageViews"),
+            "buy_box_percentage": traffic.get("buyBoxPercentage"),
+            "units_ordered": sales.get("unitsOrdered"),
+            "ordered_product_sales_amount": (sales.get("orderedProductSales") or {}).get("amount"),
+            "ordered_product_sales_currency": (sales.get("orderedProductSales") or {}).get("currencyCode"),
+            "unit_session_percentage": traffic.get("unitSessionPercentage"),
+        })
 
     print(f"Parsed {len(rows)} rows for {marketplace_name}")
     return rows
 
 
-# FIX #3: report_id, report_document_id, s3_key, file_checksum now written to every staging row
 def load_staging_rows(conn, rows, report_id, document_id, s3_key, file_checksum):
     if not rows:
         return 0
 
     sql = f"""
         INSERT INTO {STAGING_TABLE} (
-            report_id,
-            report_document_id,
-            s3_key,
-            file_checksum,
-            marketplace,
-            start_date,
-            end_date,
-            child_asin,
-            parent_asin,
-            sku,
-            sessions,
-            page_views,
-            buy_box_percentage,
-            units_ordered,
-            ordered_product_sales_amount,
-            ordered_product_sales_currency,
-            unit_session_percentage
+            report_id, report_document_id, s3_key, file_checksum,
+            marketplace, start_date, end_date,
+            child_asin, parent_asin, sku,
+            sessions, page_views, buy_box_percentage,
+            units_ordered, ordered_product_sales_amount,
+            ordered_product_sales_currency, unit_session_percentage
         )
         VALUES %s
-        ON CONFLICT (report_id, marketplace, child_asin) DO NOTHING
+        ON CONFLICT (start_date, marketplace, child_asin) DO NOTHING
     """
+    # ^^ updated from (report_id, marketplace, child_asin) to date-based key
 
     values = [
         (
-            report_id,
-            document_id,
-            s3_key,
-            file_checksum,
-            r["marketplace"],
-            r["start_date"],
-            r["end_date"],
-            r["child_asin"],
-            r["parent_asin"],
-            r["sku"],
-            r["sessions"],
-            r["page_views"],
-            r["buy_box_percentage"],
-            r["units_ordered"],
-            r["ordered_product_sales_amount"],
-            r["ordered_product_sales_currency"],
-            r["unit_session_percentage"],
+            report_id, document_id, s3_key, file_checksum,
+            r["marketplace"], r["start_date"], r["end_date"],
+            r["child_asin"], r["parent_asin"], r["sku"],
+            r["sessions"], r["page_views"], r["buy_box_percentage"],
+            r["units_ordered"], r["ordered_product_sales_amount"],
+            r["ordered_product_sales_currency"], r["unit_session_percentage"],
         )
         for r in rows
     ]
@@ -442,13 +398,9 @@ def process_marketplace(conn, marketplace_name, marketplace_enum, marketplace_id
         document_id = wait_for_report(reports_api, report_id, marketplace_name)
 
         if is_job_already_completed(conn, marketplace_name, report_id, document_id):
-            print(
-                f"Skipping {marketplace_name}: report_id={report_id} document_id={document_id} "
-                "already completed."
-            )
+            print(f"Skipping {marketplace_name}: already completed.")
             return
 
-        # FIX #5: respect DRY_RUN — skip Postgres load but still download and archive
         if config.DRY_RUN:
             print(f"DRY_RUN=True — skipping Postgres load for {marketplace_name}.")
 
@@ -525,17 +477,16 @@ def process_marketplace(conn, marketplace_name, marketplace_enum, marketplace_id
         raise
 
 
-# FIX #6: single connection, setup done once before processing any marketplace
 def main():
     print("=" * 60)
-    print("SellerIQ - Amazon Sales & Traffic Ingestion")
+    print("SellerIQ - Amazon Sales & Traffic Ingestion (Daily)")
     print("=" * 60)
 
     if config.DRY_RUN:
         print("DRY_RUN mode enabled — Postgres load will be skipped.")
 
-    start_date, end_date = get_last_full_sunday_saturday_week()
-    print(f"Date range: {start_date.date()} -> {end_date.date()}")
+    start_date, end_date = get_yesterday()
+    print(f"Date: {start_date.date()}")
 
     marketplaces = [
         ("US", Marketplaces.US, config.US_MARKETPLACE_ID),

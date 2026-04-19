@@ -1,10 +1,25 @@
+"""
+SellerIQ - Sales & Traffic Daily Backfill
+==========================================
+Pulls one report per day per marketplace from BACKFILL_START
+up to and including yesterday.
+
+Each report uses dateGranularity: DAY so every row in the
+staging table represents one product on one specific day.
+
+Safe to re-run — already-loaded days are skipped automatically.
+
+Usage:
+    python backfill_sales_traffic.py
+"""
+
 import gzip
 import hashlib
 import json
 import time
+import urllib.request
 from pathlib import Path
 from datetime import datetime, timedelta, UTC
-from typing import Any
 
 import boto3
 import psycopg2
@@ -19,13 +34,11 @@ SOURCE_SYSTEM = "amazon_sp_api"
 LOG_TABLE = "ingestion_job_log"
 STAGING_TABLE = "stg_amz_sales_traffic_daily"
 
-# ------------------------------------------------------------
-# Backfill date range
-# ------------------------------------------------------------
-# Start: first Sunday on or after January 1, 2025
-# End:   last fully completed Sunday-Saturday week before today
-# ------------------------------------------------------------
+# ── Change this date to control how far back the backfill goes ──
 BACKFILL_START = datetime(2025, 1, 1, tzinfo=UTC)
+
+# Pause between days to avoid hitting API rate limits
+SLEEP_BETWEEN_DAYS = 2  # seconds
 
 
 def utc_now() -> datetime:
@@ -36,41 +49,21 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def get_first_sunday_on_or_after(dt: datetime) -> datetime:
-    """Return the first Sunday on or after the given date."""
-    days_until_sunday = (6 - dt.weekday()) % 7
-    return (dt + timedelta(days=days_until_sunday)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-
-
-def get_backfill_weeks():
+def get_backfill_days() -> list[datetime]:
     """
-    Generate all Sunday-Saturday week windows from BACKFILL_START
-    up to and including the most recently completed full week.
-
-    Yields (start_date, end_date) tuples in chronological order.
+    Return a list of days from BACKFILL_START up to and including yesterday.
+    Each entry is midnight UTC of that day.
     """
     now = utc_now()
-
-    # Most recently completed Saturday
-    days_since_sunday = (now.weekday() + 1) % 7
-    this_sunday = (now - timedelta(days=days_since_sunday)).replace(
+    yesterday = (now - timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    last_completed_start = this_sunday - timedelta(days=7)
-    last_completed_end = this_sunday - timedelta(days=1)
-
-    # First Sunday on or after BACKFILL_START
-    week_start = get_first_sunday_on_or_after(BACKFILL_START)
-
-    weeks = []
-    while week_start <= last_completed_start:
-        week_end = week_start + timedelta(days=6)
-        weeks.append((week_start, week_end))
-        week_start += timedelta(days=7)
-
-    return weeks
+    days = []
+    current = BACKFILL_START.replace(hour=0, minute=0, second=0, microsecond=0)
+    while current <= yesterday:
+        days.append(current)
+        current += timedelta(days=1)
+    return days
 
 
 def get_sp_api_credentials():
@@ -145,6 +138,24 @@ def ensure_staging_table_exists(conn):
             )
 
 
+def is_day_already_loaded(conn, marketplace: str, date: datetime) -> bool:
+    """
+    Check if this day + marketplace already has rows in staging.
+    Uses the natural key (start_date, marketplace) — if any rows exist
+    for this day, we skip it.
+    """
+    sql = f"""
+        SELECT 1
+        FROM {STAGING_TABLE}
+        WHERE start_date = %s
+          AND marketplace = %s
+        LIMIT 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (date.date(), marketplace))
+        return cur.fetchone() is not None
+
+
 def log_job_status(
     conn,
     *,
@@ -212,35 +223,15 @@ def log_job_status(
         cur.execute(sql, params)
 
 
-def is_week_already_completed(conn, marketplace: str, start_date, end_date) -> bool:
-    """
-    Check if a completed job already exists for this marketplace + week window.
-    Uses start_date/end_date from the staging table rather than report_id,
-    since we don't know the report_id before requesting it.
-    This prevents re-requesting reports for weeks already successfully loaded.
-    """
-    sql = f"""
-        SELECT 1
-        FROM {STAGING_TABLE}
-        WHERE marketplace = %s
-          AND start_date = %s
-          AND end_date = %s
-        LIMIT 1
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (marketplace, start_date.date(), end_date.date()))
-        return cur.fetchone() is not None
-
-
-def request_sales_traffic_report(marketplace_name, marketplace_enum, marketplace_id, start_date, end_date):
+def request_report(marketplace_name, marketplace_enum, marketplace_id, day: datetime):
     reports_api = get_reports_api(marketplace_enum)
     response = reports_api.create_report(
         reportType=ReportType.GET_SALES_AND_TRAFFIC_REPORT,
-        dataStartTime=start_date.strftime("%Y-%m-%d"),
-        dataEndTime=end_date.strftime("%Y-%m-%d"),
+        dataStartTime=day.strftime("%Y-%m-%d"),
+        dataEndTime=day.strftime("%Y-%m-%d"),
         marketplaceIds=[marketplace_id],
         reportOptions={
-            "dateGranularity": "WEEK",
+            "dateGranularity": "DAY",
             "asinGranularity": "CHILD",
         },
     )
@@ -248,7 +239,7 @@ def request_sales_traffic_report(marketplace_name, marketplace_enum, marketplace
     return reports_api, report_id
 
 
-def wait_for_report(reports_api, report_id, marketplace_name, start_date):
+def wait_for_report(reports_api, report_id, marketplace_name, day: datetime):
     max_attempts = config.REPORT_POLL_MAX_ATTEMPTS
     sleep_seconds = config.REPORT_POLL_SLEEP_SECONDS
 
@@ -256,7 +247,6 @@ def wait_for_report(reports_api, report_id, marketplace_name, start_date):
         time.sleep(sleep_seconds)
         status_response = reports_api.get_report(reportId=report_id)
         status = status_response.payload.get("processingStatus")
-        print(f"    Poll {attempt}/{max_attempts} — {status}")
 
         if status == "DONE":
             return status_response.payload["reportDocumentId"]
@@ -271,7 +261,6 @@ def download_report_payload(reports_api, document_id):
     url = doc.payload["url"]
     compression = doc.payload.get("compressionAlgorithm")
 
-    import urllib.request
     with urllib.request.urlopen(url) as response:
         original_bytes = response.read()
 
@@ -284,29 +273,19 @@ def download_report_payload(reports_api, document_id):
     }
 
 
-def build_raw_paths(marketplace_name, start_date, end_date, compression):
+def save_raw_files(payload, marketplace_name, day: datetime):
     output_dir = Path(config.RAW_OUTPUT_DIR) / "amazon" / REPORT_TYPE / marketplace_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_name = f"amazon_sales_traffic_{marketplace_name}_{start_date.date()}_{end_date.date()}"
-    original_ext = ".json.gz" if compression == "GZIP" else ".json"
-    return {
-        "original_path": output_dir / f"{base_name}{original_ext}",
-        "parsed_path": output_dir / f"{base_name}.json",
-    }
+    ext = ".json.gz" if payload["compression"] == "GZIP" else ".json"
+    original_path = output_dir / f"amazon_sales_traffic_{marketplace_name}_{day.date()}{ext}"
+    original_path.write_bytes(payload["original_bytes"])
+    return original_path
 
 
-def save_raw_files(payload, marketplace_name, start_date, end_date):
-    paths = build_raw_paths(marketplace_name, start_date, end_date, payload["compression"])
-    paths["original_path"].write_bytes(payload["original_bytes"])
-    if paths["parsed_path"] != paths["original_path"]:
-        paths["parsed_path"].write_bytes(payload["parsed_bytes"])
-    return paths
-
-
-def upload_to_s3(local_path, marketplace_name, start_date):
+def upload_to_s3(local_path: Path, marketplace_name, day: datetime):
     s3_key = (
         f"amazon/{REPORT_TYPE}/"
-        f"{marketplace_name}/{start_date:%Y/%m/%d}/"
+        f"{marketplace_name}/{day:%Y/%m/%d}/"
         f"{local_path.name}"
     )
     s3 = get_s3_client()
@@ -314,15 +293,15 @@ def upload_to_s3(local_path, marketplace_name, start_date):
     return s3_key
 
 
-def parse_sales_traffic_rows(report_json, marketplace_name, start_date, end_date):
+def parse_rows(report_json, marketplace_name, day: datetime):
     rows = []
     for row in report_json.get("salesAndTrafficByAsin", []):
         sales = row.get("salesByAsin", {})
         traffic = row.get("trafficByAsin", {})
         rows.append({
             "marketplace": marketplace_name,
-            "start_date": start_date.date(),
-            "end_date": end_date.date(),
+            "start_date": day.date(),
+            "end_date": day.date(),
             "child_asin": row.get("childAsin"),
             "parent_asin": row.get("parentAsin"),
             "sku": row.get("sku"),
@@ -351,7 +330,7 @@ def load_staging_rows(conn, rows, report_id, document_id, s3_key, file_checksum)
             ordered_product_sales_currency, unit_session_percentage
         )
         VALUES %s
-        ON CONFLICT (report_id, marketplace, child_asin) DO NOTHING
+        ON CONFLICT (start_date, marketplace, child_asin) DO NOTHING
     """
     values = [
         (
@@ -367,32 +346,29 @@ def load_staging_rows(conn, rows, report_id, document_id, s3_key, file_checksum)
     with conn.cursor() as cur:
         execute_values(cur, sql, values)
         inserted = cur.rowcount
-
     return inserted
 
 
-def process_week(conn, marketplace_name, marketplace_enum, marketplace_id, start_date, end_date):
-    """Process one week for one marketplace. Skips if already loaded."""
+def process_day(conn, marketplace_name, marketplace_enum, marketplace_id, day: datetime):
+    """Process one day for one marketplace. Skips if already loaded."""
 
-    if is_week_already_completed(conn, marketplace_name, start_date, end_date):
-        print(f"  [{marketplace_name}] {start_date.date()} already loaded — skipping")
+    if is_day_already_loaded(conn, marketplace_name, day):
+        print(f"  [{marketplace_name}] {day.date()} — already loaded, skipping")
         return
-
-    print(f"  [{marketplace_name}] {start_date.date()} → {end_date.date()} — requesting...")
 
     requested_at = utc_now()
     report_id = None
     document_id = None
-    downloaded_at = None
-    loaded_at = None
     s3_key = None
     file_checksum = None
     local_file_path = None
+    downloaded_at = None
+    loaded_at = None
     row_count = None
 
     try:
-        reports_api, report_id = request_sales_traffic_report(
-            marketplace_name, marketplace_enum, marketplace_id, start_date, end_date
+        reports_api, report_id = request_report(
+            marketplace_name, marketplace_enum, marketplace_id, day
         )
         log_job_status(
             conn, marketplace=marketplace_name,
@@ -401,14 +377,14 @@ def process_week(conn, marketplace_name, marketplace_enum, marketplace_id, start
         )
         conn.commit()
 
-        document_id = wait_for_report(reports_api, report_id, marketplace_name, start_date)
+        document_id = wait_for_report(reports_api, report_id, marketplace_name, day)
         payload = download_report_payload(reports_api, document_id)
         downloaded_at = utc_now()
         file_checksum = sha256_hex(payload["original_bytes"])
 
-        paths = save_raw_files(payload, marketplace_name, start_date, end_date)
-        local_file_path = str(paths["original_path"])
-        s3_key = upload_to_s3(paths["original_path"], marketplace_name, start_date)
+        local_path = save_raw_files(payload, marketplace_name, day)
+        local_file_path = str(local_path)
+        s3_key = upload_to_s3(local_path, marketplace_name, day)
 
         log_job_status(
             conn, marketplace=marketplace_name,
@@ -420,7 +396,7 @@ def process_week(conn, marketplace_name, marketplace_enum, marketplace_id, start
         conn.commit()
 
         report_json = json.loads(payload["parsed_bytes"].decode("utf-8"))
-        rows = parse_sales_traffic_rows(report_json, marketplace_name, start_date, end_date)
+        rows = parse_rows(report_json, marketplace_name, day)
         row_count = load_staging_rows(
             conn, rows,
             report_id=report_id, document_id=document_id,
@@ -438,7 +414,7 @@ def process_week(conn, marketplace_name, marketplace_enum, marketplace_id, start
         )
         conn.commit()
 
-        print(f"  [{marketplace_name}] {start_date.date()} — inserted {row_count} rows")
+        print(f"  [{marketplace_name}] {day.date()} — inserted {row_count} rows")
 
     except Exception as exc:
         log_job_status(
@@ -451,20 +427,20 @@ def process_week(conn, marketplace_name, marketplace_enum, marketplace_id, start
             error_message=str(exc),
         )
         conn.commit()
-        # Log the failure but continue to next week rather than halting the entire backfill
-        print(f"  [{marketplace_name}] {start_date.date()} — FAILED: {exc}")
+        # Log and continue — don't let one failed day stop the entire backfill
+        print(f"  [{marketplace_name}] {day.date()} — FAILED: {exc}")
 
 
 def main():
-    print("=" * 60)
-    print("SellerIQ - Sales & Traffic Backfill")
-    print("=" * 60)
+    days = get_backfill_days()
 
-    weeks = get_backfill_weeks()
-    print(f"Backfill range: {weeks[0][0].date()} → {weeks[-1][1].date()}")
-    print(f"Total weeks: {len(weeks)}")
-    print(f"Marketplaces: US, CA")
-    print(f"Total report requests: {len(weeks) * 2}")
+    print("=" * 60)
+    print("SellerIQ - Sales & Traffic Daily Backfill")
+    print("=" * 60)
+    print(f"Backfill range: {days[0].date()} → {days[-1].date()}")
+    print(f"Total days:     {len(days)}")
+    print(f"Marketplaces:   US, CA")
+    print(f"Total requests: {len(days) * 2}")
     print()
 
     marketplaces = [
@@ -478,16 +454,14 @@ def main():
             ensure_log_table_exists(conn)
             ensure_staging_table_exists(conn)
 
-        for i, (start_date, end_date) in enumerate(weeks, 1):
-            print(f"Week {i}/{len(weeks)}: {start_date.date()} → {end_date.date()}")
+        for i, day in enumerate(days, 1):
+            print(f"Day {i}/{len(days)}: {day.date()}")
             for marketplace_name, marketplace_enum, marketplace_id in marketplaces:
-                process_week(
-                    conn, marketplace_name, marketplace_enum, marketplace_id,
-                    start_date, end_date
-                )
-            # Pause between weeks to avoid hitting API rate limits
-            if i < len(weeks):
-                time.sleep(2)
+                process_day(conn, marketplace_name, marketplace_enum, marketplace_id, day)
+
+            # Pause between days to respect API rate limits
+            if i < len(days):
+                time.sleep(SLEEP_BETWEEN_DAYS)
 
     finally:
         conn.close()
