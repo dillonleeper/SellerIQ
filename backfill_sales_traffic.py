@@ -358,7 +358,7 @@ def process_day(marketplace_name, marketplace_enum, marketplace_id, day: datetim
     try:
         if is_day_already_loaded(conn, marketplace_name, day):
             print(f"  [{marketplace_name}] {day.date()} — already loaded, skipping")
-            return
+            return False
 
         requested_at = utc_now()
         report_id = None
@@ -419,6 +419,7 @@ def process_day(marketplace_name, marketplace_enum, marketplace_id, day: datetim
             conn.commit()
 
             print(f"  [{marketplace_name}] {day.date()} — inserted {row_count} rows")
+            return True
 
         except Exception as exc:
             log_job_status(
@@ -433,6 +434,7 @@ def process_day(marketplace_name, marketplace_enum, marketplace_id, day: datetim
             conn.commit()
             # Log and continue — don't let one failed day stop the entire backfill
             print(f"  [{marketplace_name}] {day.date()} — FAILED: {exc}")
+            return True
     finally:
         conn.close()
 
@@ -473,11 +475,10 @@ def main():
                     )
                     for marketplace_name, marketplace_enum, marketplace_id in marketplaces
                 ]
-                for future in futures:
-                    future.result()
+                results = [future.result() for future in futures]
 
                 # Pause between days to respect API rate limits
-                if i < len(days):
+                if i < len(days) and any(results):
                     time.sleep(SLEEP_BETWEEN_DAYS)
 
     finally:
