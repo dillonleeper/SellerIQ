@@ -29,13 +29,16 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def get_yesterday() -> tuple[datetime, datetime]:
-    """Return yesterday as (start_date, end_date) — both the same day."""
+def get_recent_days() -> list[tuple[datetime, datetime]]:
+    """Return the last 3 completed days as single-day (start_date, end_date) tuples."""
     now = utc_now()
-    yesterday = (now - timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return yesterday, yesterday
+    recent_days = []
+    for offset in range(1, 4):
+        day = (now - timedelta(days=offset)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        recent_days.append((day, day))
+    return recent_days
 
 
 def get_sp_api_credentials():
@@ -343,9 +346,16 @@ def load_staging_rows(conn, rows, report_id, document_id, s3_key, file_checksum)
             ordered_product_sales_currency, unit_session_percentage
         )
         VALUES %s
-        ON CONFLICT (start_date, marketplace, child_asin) DO NOTHING
+        ON CONFLICT (start_date, marketplace, child_asin) DO UPDATE SET
+            units_ordered = EXCLUDED.units_ordered,
+            ordered_product_sales_amount = EXCLUDED.ordered_product_sales_amount,
+            sessions = EXCLUDED.sessions,
+            page_views = EXCLUDED.page_views,
+            buy_box_percentage = EXCLUDED.buy_box_percentage,
+            unit_session_percentage = EXCLUDED.unit_session_percentage,
+            report_id = EXCLUDED.report_id,
+            report_document_id = EXCLUDED.report_document_id
     """
-    # ^^ updated from (report_id, marketplace, child_asin) to date-based key
 
     values = [
         (
@@ -485,8 +495,11 @@ def main():
     if config.DRY_RUN:
         print("DRY_RUN mode enabled — Postgres load will be skipped.")
 
-    start_date, end_date = get_yesterday()
-    print(f"Date: {start_date.date()}")
+    recent_days = get_recent_days()
+    print(
+        "Dates: "
+        + ", ".join(start_date.strftime("%Y-%m-%d") for start_date, _ in recent_days)
+    )
 
     marketplaces = [
         ("US", Marketplaces.US, config.US_MARKETPLACE_ID),
@@ -499,15 +512,17 @@ def main():
             ensure_log_table_exists(conn)
             ensure_staging_table_exists(conn)
 
-        for marketplace_name, marketplace_enum, marketplace_id in marketplaces:
-            process_marketplace(
-                conn,
-                marketplace_name,
-                marketplace_enum,
-                marketplace_id,
-                start_date,
-                end_date,
-            )
+        for start_date, end_date in recent_days:
+            print(f"Processing date: {start_date.date()}")
+            for marketplace_name, marketplace_enum, marketplace_id in marketplaces:
+                process_marketplace(
+                    conn,
+                    marketplace_name,
+                    marketplace_enum,
+                    marketplace_id,
+                    start_date,
+                    end_date,
+                )
     finally:
         conn.close()
 
