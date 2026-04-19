@@ -39,7 +39,7 @@ STAGING_TABLE = "stg_amz_sales_traffic_daily"
 BACKFILL_START = datetime(2025, 1, 1, tzinfo=UTC)
 
 # Pause between days to avoid hitting API rate limits
-SLEEP_BETWEEN_DAYS = 4  # seconds
+SLEEP_BETWEEN_DAYS = 6  # seconds
 
 
 def utc_now() -> datetime:
