@@ -341,6 +341,12 @@ def load_staging_rows(conn, rows, report_id, document_id, s3_key, file_checksum)
     if not rows:
         return 0
 
+    seen = {}
+    for r in rows:
+        key = (r["start_date"], r["marketplace"], r["child_asin"])
+        seen[key] = r
+    rows = list(seen.values())
+
     sql = f"""
         INSERT INTO {STAGING_TABLE} (
             report_id, report_document_id, s3_key, file_checksum,
