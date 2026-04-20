@@ -326,32 +326,30 @@ def upload_to_s3(local_path: Path, marketplace_name, start_date: datetime):
 
 def parse_rows(report_json, marketplace_name):
     rows = []
-    for row in report_json.get("salesAndTrafficByAsin", []):
-        row_date = row.get("date") or row.get("startDate")
+    for day_entry in report_json.get("salesAndTrafficByDate", []):
+        row_date = day_entry.get("date")
         if row_date is None:
-            raise RuntimeError(
-                "Expected day-level salesAndTrafficByAsin rows with a date/startDate field "
-                "for monthly DAY-granularity backfill."
-            )
+            continue
 
         day = datetime.fromisoformat(row_date).date()
-        sales = row.get("salesByAsin", {})
-        traffic = row.get("trafficByAsin", {})
-        rows.append({
-            "marketplace": marketplace_name,
-            "start_date": day,
-            "end_date": day,
-            "child_asin": row.get("childAsin"),
-            "parent_asin": row.get("parentAsin"),
-            "sku": row.get("sku"),
-            "sessions": traffic.get("sessions"),
-            "page_views": traffic.get("pageViews"),
-            "buy_box_percentage": traffic.get("buyBoxPercentage"),
-            "units_ordered": sales.get("unitsOrdered"),
-            "ordered_product_sales_amount": (sales.get("orderedProductSales") or {}).get("amount"),
-            "ordered_product_sales_currency": (sales.get("orderedProductSales") or {}).get("currencyCode"),
-            "unit_session_percentage": traffic.get("unitSessionPercentage"),
-        })
+        for row in day_entry.get("salesAndTrafficByAsin", []):
+            sales = row.get("salesByAsin", {})
+            traffic = row.get("trafficByAsin", {})
+            rows.append({
+                "marketplace": marketplace_name,
+                "start_date": day,
+                "end_date": day,
+                "child_asin": row.get("childAsin"),
+                "parent_asin": row.get("parentAsin"),
+                "sku": row.get("sku"),
+                "sessions": traffic.get("sessions"),
+                "page_views": traffic.get("pageViews"),
+                "buy_box_percentage": traffic.get("buyBoxPercentage"),
+                "units_ordered": sales.get("unitsOrdered"),
+                "ordered_product_sales_amount": (sales.get("orderedProductSales") or {}).get("amount"),
+                "ordered_product_sales_currency": (sales.get("orderedProductSales") or {}).get("currencyCode"),
+                "unit_session_percentage": traffic.get("unitSessionPercentage"),
+            })
     return rows
 
 
