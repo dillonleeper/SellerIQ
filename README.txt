@@ -1,41 +1,43 @@
 # SellerIQ
 
-**Ecommerce Data Warehouse & Analytics Pipeline**
+**Ecommerce data pipeline and warehouse**
 
-SellerIQ is a production-grade data pipeline and dimensional warehouse built to ingest, model, and analyze marketplace data from Amazon SP-API and Walmart Marketplace API.
+SellerIQ is an ecommerce analytics project I'm building around problems I've dealt with at work: getting marketplace data out of different systems, organizing it, and using it to answer questions. This repository contains the Python ingestion scripts and PostgreSQL warehouse SQL.
 
-It replaces manual spreadsheet workflows with a reliable, scalable, and reprocessable data system — raw files preserved in S3, structured data modeled in Postgres, and a clean warehouse layer ready for dashboards and AI-assisted analytics.
+I'm moving reporting work from spreadsheets into a pipeline that saves raw responses in S3 and loads structured data into Postgres. The public default branch, `stable-weekly`, covers Amazon sales and traffic, catalog items, listings, and FBA inventory. Walmart support and the other sources listed below are plans for this branch, not implemented integrations.
+
+The dashboard is in [selleriq-app](https://github.com/dillonleeper/selleriq-app), and the public website is in [selleriq-site](https://github.com/dillonleeper/selleriq-site).
 
 ---
 
 ## Architecture
 
 ```
-Amazon SP-API / Walmart API
-        │
-        ▼
-  Report Request & Poll
-        │
-        ▼
+Amazon SP-API
+        â”‚
+        â–¼
+  Reports / Catalog Requests
+        â”‚
+        â–¼
   Raw File Download
-        │
-        ▼
-  S3 Raw Archive (immutable)
-        │
-        ▼
+        â”‚
+        â–¼
+  S3 Raw Archive
+        â”‚
+        â–¼
   Postgres Staging (stg_*)
-        │
-        ▼
+        â”‚
+        â–¼
   Intermediate Layer (int_*)
-        │
-        ▼
+        â”‚
+        â–¼
   Fact & Dimension Tables (fct_*, dim_*)
-        │
-        ▼
-  Dashboards / AI Query Layer
+        â”‚
+        â–¼
+  Dashboard (separate repo)
 ```
 
-Every raw file is preserved in S3 before transformation. Every ingestion job is logged with status, timing, file path, checksum, and row count. Every pipeline is idempotent — safe to rerun without creating duplicates.
+The scripts archive raw report or catalog responses in S3 and load staging tables in Postgres. Sales and inventory ingestion include job-status logging. Conflict handling and restart behavior vary by script; see the notes below before rerunning a load.
 
 ---
 
@@ -49,17 +51,17 @@ Every raw file is preserved in S3 before transformation. Every ingestion job is 
 | API SDK | python-amazon-sp-api |
 | DB Driver | psycopg2 |
 | AWS Client | boto3 |
-| Sources | Amazon SP-API, Walmart Marketplace API |
+| Implemented source | Amazon SP-API |
 
 ---
 
 ## Data Sources
 
-### Currently Ingested
-- **Amazon Sales & Traffic** — weekly sales, sessions, page views, buy box %, conversion by ASIN
-- **Amazon Catalog Items** — product titles, brands, parent/child ASIN relationships
-- **Amazon Listings** — SKU to ASIN mapping via merchant listings report
-- **Amazon FBA Inventory** — daily fulfillable, reserved, inbound, and available quantities
+### Implemented on this branch
+- **Amazon Sales & Traffic** â€” weekly sales, sessions, page views, buy box %, conversion by ASIN
+- **Amazon Catalog Items** â€” product titles, brands, parent/child ASIN relationships
+- **Amazon Listings** â€” SKU to ASIN mapping via merchant listings report
+- **Amazon FBA Inventory** â€” daily fulfillable, reserved, inbound, and available quantities
 
 ### Planned
 - Amazon Orders / Order Items
@@ -72,23 +74,23 @@ Every raw file is preserved in S3 before transformation. Every ingestion job is 
 
 ## Warehouse Schema
 
-### Phase 1 — Sales & Traffic
+### Phase 1 â€” Sales & Traffic
 
 | Table | Grain | Description |
 |---|---|---|
 | `stg_amz_sales_traffic_daily` | report_id + child_asin + marketplace | Raw weekly sales and traffic data from SP-API |
-| `ingestion_job_log` | one row per job run | Full audit log for every pipeline execution |
+| `ingestion_job_log` | one row per job run | Report-ingestion status and metadata |
 
-### Phase 2 — Product Identity
+### Phase 2 â€” Product Identity
 
 | Table | Grain | Description |
 |---|---|---|
 | `stg_amz_catalog_items` | asin + marketplace | Raw catalog metadata from Catalog Items API |
-| `stg_amz_listings` | sku + marketplace | Raw SKU → ASIN mapping from listings report |
+| `stg_amz_listings` | sku + marketplace | Raw SKU â†’ ASIN mapping from listings report |
 | `dim_product` | asin + marketplace | Canonical product dimension with SKU, title, brand |
 | `int_product_identity_map` | child_asin + marketplace | Bridge table mapping sales rows to dim_product |
 
-### Phase 3 — Inventory
+### Phase 3 â€” Inventory
 
 | Table | Grain | Description |
 |---|---|---|
@@ -101,8 +103,8 @@ Every raw file is preserved in S3 before transformation. Every ingestion job is 
 
 | Script | Purpose |
 |---|---|
-| `ingest_sales_traffic.py` | Weekly Sales & Traffic ingestion (current week) |
-| `backfill_sales_traffic.py` | Historical backfill — Jan 2025 to present |
+| `ingest_sales_traffic.py` | Weekly Sales & Traffic ingestion (last complete week) |
+| `backfill_sales_traffic.py` | Historical backfill â€” Jan 2025 to present |
 | `ingest_catalog.py` | Catalog metadata ingestion + dim_product build |
 | `ingest_listings.py` | Listings report ingestion + SKU backfill to dim_product |
 | `ingest_inventory.py` | Daily FBA inventory snapshot ingestion |
@@ -111,23 +113,23 @@ Every raw file is preserved in S3 before transformation. Every ingestion job is 
 
 ## Key Design Decisions
 
-**Report-based ingestion over live API polling**
-All data is pulled via Amazon's Reports API rather than live endpoint calls. This is more stable, better for batch processing, and produces reprocessable raw files.
+**Reports for batch ingestion**
+Sales and traffic, listings, and FBA inventory use Amazon's Reports API. Catalog metadata uses the Catalog Items API directly. Both paths save raw responses for later inspection or reprocessing.
 
-**Idempotent loads**
-Every staging table uses `ON CONFLICT DO NOTHING` with natural key constraints. Running the same pipeline twice produces no duplicates.
+**Conflict handling and reruns**
+Sales staging uses `ON CONFLICT DO NOTHING` on `(report_id, marketplace, child_asin)`. Catalog and listings use upserts, while inventory loads use date/SKU/marketplace keys. A new report ID for the same sales period is not blocked by the report-ID constraint, so these keys do not guarantee period-level deduplication. The backfill script separately checks completed jobs by marketplace and week.
 
-**Raw files are immutable**
-Every report is saved to S3 before any transformation. If a parser breaks or a schema changes, raw data can be reprocessed from the original source file.
+**Keep the raw responses**
+The scripts save raw responses in S3 so parsing can be revisited later. This code does not configure S3 Object Lock or bucket versioning; keeping an immutable archive depends on the bucket configuration and write permissions.
 
 **Layered warehouse modeling**
-Data flows through four distinct layers — staging preserves source columns, intermediate handles joins and deduplication, facts define business grains, dimensions provide stable join keys. Business logic never lives in dashboards.
+The SQL separates staging, intermediate, fact, and dimension tables. Staging keeps the source data, the product identity map connects ASINs to product IDs, and the inventory fact joins snapshots to products. I use these layers to keep shared definitions in the database where possible.
 
 **Canonical product identity**
 Product identity is resolved through a dedicated intermediate table (`int_product_identity_map`) that maps raw ASINs to a stable `product_id` in `dim_product`. SKU, ASIN, parent ASIN, title, and brand are all normalized in one place.
 
-**Full pipeline observability**
-Every ingestion job writes to `ingestion_job_log` regardless of success or failure — recording report ID, document ID, S3 path, file checksum, row count, status, and error message.
+**Ingestion logs**
+`ingestion_job_log` records report IDs, document IDs, S3 paths, checksums, row counts, statuses, and errors where the ingestion script supplies them. Logging coverage differs across scripts; it is not a complete monitoring system for every operation.
 
 ---
 
@@ -135,7 +137,7 @@ Every ingestion job writes to `ingestion_job_log` regardless of success or failu
 
 ### Prerequisites
 - Python 3.11+
-- PostgreSQL database (Supabase recommended)
+- PostgreSQL database (I use Supabase)
 - Amazon AWS account with S3 bucket
 - Amazon SP-API developer app with refresh token
 
@@ -145,7 +147,7 @@ pip install python-amazon-sp-api boto3 psycopg2-binary
 ```
 
 ### Configure credentials
-Copy `config.py.example` to `config.py` and fill in your values:
+Create a local `config.py` using the settings below. There is no checked-in config template on this branch. `config.py` is ignored by Git; keep credentials out of commits:
 
 ```python
 # Amazon SP-API
@@ -176,32 +178,34 @@ REPORT_POLL_MAX_ATTEMPTS  = 30
 REPORT_POLL_SLEEP_SECONDS = 30
 DRY_RUN                   = False
 ENVIRONMENT               = "dev"
+RAW_OUTPUT_DIR            = "raw_reports"
 ```
 
 ### Run DDL
-Create the warehouse tables in your Postgres database:
+Review the DDL before applying it to your own Postgres database. From the repository root, the checked-in files can be run in `psql` in this order:
 
 ```sql
 -- Run in order
-\i sql/phase1_ddl.sql
-\i sql/phase2_ddl.sql
-\i sql/phase2_ddl_append.sql
-\i sql/phase3_ddl.sql
+\i sql/selleriq_phase1_ddl.sql
+\i sql/selleriq_phase2_ddl.sql
+\i sql/selleriq_phase3_ddl.sql
 ```
+
+The scripts require your own SP-API access, S3 bucket, and database. This is not a self-contained demo with sample marketplace data. Some maintenance scripts assume additional database changes: for example, `reload_sales_from_s3.py` uses a period-based conflict key that differs from the checked-in Phase 1 DDL. Check those assumptions before using maintenance or reload scripts.
 
 ### Run ingestion
 ```bash
-# Phase 1 — current week sales & traffic
+# Phase 1 â€” current week sales & traffic
 python ingest_sales_traffic.py
 
-# Phase 1 — historical backfill
+# Phase 1 â€” historical backfill
 python backfill_sales_traffic.py
 
-# Phase 2 — catalog and product identity
+# Phase 2 â€” catalog and product identity
 python ingest_catalog.py
 python ingest_listings.py
 
-# Phase 3 — daily inventory snapshot
+# Phase 3 â€” daily inventory snapshot
 python ingest_inventory.py
 ```
 
@@ -209,10 +213,12 @@ python ingest_inventory.py
 
 ## Backfill
 
-The backfill script processes all Sunday–Saturday weeks from January 2025 to present. It is safe to stop and restart at any point — already-loaded weeks are detected and skipped automatically.
+The backfill script starts with the first Sunday on or after January 1, 2025 and ends with the last complete Sundayâ€“Saturday week. It skips weeks recorded as completed in the job log. After an interrupted or failed run, check the job log and loaded rows before restarting.
+
+The original README recorded this example run; these figures are historical, not a current database count:
 
 ```
-Backfill range: 2025-01-05 → 2026-03-14
+Backfill range: 2025-01-05 â†’ 2026-03-14
 Total weeks: 62
 Marketplaces: US, CA
 Total rows loaded: ~14,600
@@ -220,29 +226,29 @@ Total rows loaded: ~14,600
 
 ---
 
-## Project Status
+## Branch scope and plans
 
 | Phase | Status |
 |---|---|
-| Phase 0 — Infrastructure | ✅ Complete |
-| Phase 1 — Sales & Traffic | ✅ Complete |
-| Phase 2 — Product Identity | ✅ Complete |
-| Phase 3 — Inventory Snapshots | ✅ Complete |
-| Phase 4 — Order Item Detail | 🔄 Planned |
-| Phase 5 — Finance & Fees | 🔄 Planned |
-| Phase 6 — Amazon Advertising | 🔄 Planned |
-| Phase 7 — Walmart Marketplace | 🔄 Planned |
-| Phase 8 — Walmart Advertising | 🔄 Planned |
-| Phase 9 — Unified Profitability & AI Layer | 🔄 Planned |
+| Phase 0 â€” Infrastructure | Scripts and SQL present |
+| Phase 1 â€” Sales & Traffic | Scripts and SQL present |
+| Phase 2 â€” Product Identity | Scripts and SQL present |
+| Phase 3 â€” Inventory Snapshots | Scripts and SQL present |
+| Phase 4 â€” Order Item Detail | Planned |
+| Phase 5 â€” Finance & Fees | Planned |
+| Phase 6 â€” Amazon Advertising | Planned |
+| Phase 7 â€” Walmart Marketplace | Planned |
+| Phase 8 â€” Walmart Advertising | Planned |
+| Phase 9 â€” Unified Profitability & AI Layer | Planned |
 
 ---
 
 ## Documentation
 
-Architecture decisions, schema definitions, metric definitions, ingestion rules, and build order are documented in the `markdowns/` folder.
+The checked-in `sql/` files contain schema definitions and comments about table grains. The `markdowns/` folder referenced in earlier documentation is ignored by Git and is not included in this public repository.
 
 ---
 
 ## License
 
-Private project. Not licensed for external use.
+The repository is public, but no license for external use is granted.
