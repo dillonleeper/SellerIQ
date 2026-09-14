@@ -1,5 +1,11 @@
 # SellerIQ
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme-card-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/readme-card-light.svg">
+  <img alt="SellerIQ — S3 and PostgreSQL marketplace data" src="assets/readme-card-light.svg" width="100%">
+</picture>
+
 SellerIQ is the next version of an idea I first explored in my [DIY Amazon Sales & Traffic Pipeline](https://github.com/dillonleeper/amazon-sp-api-sales-pipeline): pull marketplace data automatically so I do not have to live in Seller Central reports and spreadsheets.
 
 The earlier project sends a small set of weekly metrics directly to Google Sheets. SellerIQ handles the data differently. It saves the original API responses in S3, transforms them with Python, and loads structured tables into PostgreSQL. A separate dashboard can then query those tables without using a spreadsheet as the database.
